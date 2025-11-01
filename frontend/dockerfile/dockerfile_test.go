@@ -101,6 +101,7 @@ var allTests = integration.TestFuncs(
 	testLabels,
 	testCacheImportExport,
 	testImageManifestCacheImportExport,
+	testInlineCacheMultiStageIndependentLayers,
 	testReproducibleIDs,
 	testImportExportReproducibleIDs,
 	testNoCache,
@@ -10626,6 +10627,123 @@ func (*networkModeHost) UpdateConfigFile(in string) (string, func() error) {
 }
 
 type networkModeSandbox struct{}
+
+// testInlineCacheMultiStageIndependentLayers tests that changing a file in stage2
+// doesn't invalidate the cache for stage1 (which doesn't depend on that file)
+// This is a regression test for a bug in BuildKit v0.8.3 where inline cache
+// incorrectly invalidated independent upstream stages when a downstream stage's
+// file selector changed.
+func testInlineCacheMultiStageIndependentLayers(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureCacheExport, workers.FeatureCacheBackendLocal)
+	f := getFrontend(t, sb)
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	// Multi-stage Dockerfile where stage1 is independent of the copied file
+	dockerfile := []byte(`
+FROM busybox AS stage1
+# This stage doesn't depend on the dummy file
+RUN echo "stage1-output" > /stage1.txt
+# Generate a unique file to detect if stage1 was rebuilt
+RUN cat /dev/urandom | head -c 100 | sha256sum > /stage1_unique.txt
+
+FROM stage1 AS stage2
+# This stage copies the dummy file (which we'll change)
+COPY dummy /dummy
+
+FROM scratch AS stage3
+COPY --from=stage2 /dummy /dummy
+COPY --from=stage2 /stage1_unique.txt /stage1_unique.txt
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("dummy", []byte("x"), 0600), // Initial content: 'x'
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	target := registry + "/buildkit/testinlinecachemultistage:latest"
+
+	// Build 1: Export cache with dummy='x'
+	destDir1 := t.TempDir()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir1,
+			},
+		},
+		CacheExports: []client.CacheOptionsEntry{
+			{
+				Type: "registry",
+				Attrs: map[string]string{
+					"ref": target,
+				},
+			},
+		},
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	// Read the unique file from stage1 (should be cached in subsequent builds)
+	stage1Unique1, err := os.ReadFile(filepath.Join(destDir1, "stage1_unique.txt"))
+	require.NoError(t, err)
+
+	// Prune all cache to force using imported cache
+	ensurePruneAll(t, c, sb)
+
+	// Build 2: Change dummy file and rebuild with cache-from
+	err = os.WriteFile(filepath.Join(dir.Name, "dummy"), []byte("y"), 0600)
+	require.NoError(t, err)
+
+	destDir2 := t.TempDir()
+
+	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+		FrontendAttrs: map[string]string{
+			"cache-from": target,
+		},
+		Exports: []client.ExportEntry{
+			{
+				Type:      client.ExporterLocal,
+				OutputDir: destDir2,
+			},
+		},
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	// Read the unique file from stage1 again
+	stage1Unique2, err := os.ReadFile(filepath.Join(destDir2, "stage1_unique.txt"))
+	require.NoError(t, err)
+
+	// BUG CHECK: stage1_unique should be the SAME (cached) because stage1
+	// doesn't depend on the dummy file that changed.
+	// If they're different, it means stage1 was rebuilt (cache was invalidated incorrectly).
+	require.Equal(t, string(stage1Unique1), string(stage1Unique2),
+		"stage1 was rebuilt even though it doesn't depend on the changed file. "+
+			"This indicates the cache incorrectly invalidated stage1 "+
+			"when stage2's file selector changed.")
+
+	// Verify dummy file DID change (sanity check)
+	dummy2, err := os.ReadFile(filepath.Join(destDir2, "dummy"))
+	require.NoError(t, err)
+	require.Equal(t, "y", string(dummy2), "dummy file should have changed to 'y'")
+}
 
 func (*networkModeSandbox) UpdateConfigFile(in string) (string, func() error) {
 	return in, nil
