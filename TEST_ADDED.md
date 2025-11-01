@@ -110,3 +110,11 @@ When stage2's file selector changes (dummy: x→y):
 3. **Verify the fix**: Run the test again (should pass)
 4. **Submit PR**: Include this test as regression coverage
 
+Potentially related issues:
+https://github.com/moby/moby/issues/43124
+https://github.com/moby/buildkit/issues/1876
+https://github.com/moby/buildkit/issues/3188
+https://github.com/moby/buildkit/issues/2973
+https://github.com/moby/buildkit/discussions/5415
+https://github.com/moby/buildkit/issues/2120
+https://www.augmentedmind.de/2023/01/08/docker-build-cache-debug/
